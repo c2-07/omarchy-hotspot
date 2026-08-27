@@ -1,15 +1,62 @@
-use dialoguer::{Input, Select, theme::ColorfulTheme};
+use dialoguer::{Confirm, Input, Select, theme::ColorfulTheme};
 use image::Luma;
 use qrcode::QrCode;
+use serde::{Deserialize, Serialize};
+use std::env;
 use std::fs;
-use std::io::{self, BufRead, BufReader, Write};
+use std::io::{self, Write};
+use std::path::PathBuf;
 use std::process::{Command, Stdio};
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 use std::time::Duration;
 
+#[derive(Serialize, Deserialize, Clone)]
+struct HotspotConfig {
+    ssid: String,
+    password: String,
+    internet_iface: String,
+    wifi_iface: String,
+    freq_band: String,
+}
+
+fn get_config_path() -> Option<PathBuf> {
+    let home = env::var("HOME").ok()?;
+    let mut path = PathBuf::from(home);
+    path.push(".config");
+    path.push("omarchy-hotspot");
+    fs::create_dir_all(&path).ok()?;
+    path.push("config.json");
+    Some(path)
+}
+
+fn load_config() -> Option<HotspotConfig> {
+    let path = get_config_path()?;
+    let data = fs::read_to_string(path).ok()?;
+    serde_json::from_str(&data).ok()
+}
+
+fn save_config(config: &HotspotConfig) {
+    if let Some(path) = get_config_path() {
+        if let Ok(data) = serde_json::to_string_pretty(config) {
+            let _ = fs::write(path, data);
+        }
+    }
+}
+
 fn main() -> io::Result<()> {
+    let args: Vec<String> = env::args().collect();
+    if args.len() > 1 && args[1] == "stop" {
+        println!("Stopping hotspot...");
+        cleanup_virtual_interfaces();
+        cleanup_stale_processes();
+        let _ = Command::new("sudo")
+            .args(&["pkill", "-SIGINT", "-f", "create_ap"])
+            .status();
+        let _ = Command::new("pkill").arg("imv").status();
+        println!("Success: Hotspot stopped and cleaned up successfully.");
+        return Ok(());
+    }
+
     print_logo();
     println!("Starting Omarchy Hotspot Setup Manager...\n");
 
@@ -46,145 +93,113 @@ fn main() -> io::Result<()> {
     // 5. Interactive prompts using dialoguer
     let theme = ColorfulTheme::default();
 
-    let ssid: String = Input::with_theme(&theme)
-        .with_prompt("Enter Hotspot SSID (Name)")
-        .default("DCT_Linux".to_string())
-        .interact_text()?;
+    let saved_config = load_config();
+    let mut use_saved = false;
 
-    let password: String = Input::with_theme(&theme)
-        .with_prompt("Enter Hotspot Password (min. 8 chars)")
-        .default("Tryh4ckm3;".to_string())
-        .validate_with(|input: &String| -> Result<(), &str> {
-            if input.len() >= 8 {
-                Ok(())
-            } else {
-                Err("Password must be at least 8 characters long")
-            }
-        })
-        .interact_text()?;
+    if let Some(ref config) = saved_config {
+        println!("\nFound saved configuration (SSID: '{}').", config.ssid);
+        use_saved = Confirm::with_theme(&theme)
+            .with_prompt("Do you want to use the saved configuration?")
+            .default(true)
+            .interact()?;
+    }
 
-    // Select internet interface
-    let internet_index = Select::with_theme(&theme)
-        .with_prompt("Select interface providing internet")
-        .items(&interfaces)
-        .default(
-            interfaces
-                .iter()
-                .position(|x| *x == default_internet)
-                .unwrap_or(0),
+    let (ssid, password, internet_iface, wifi_iface, freq_band) = if use_saved {
+        let config = saved_config.unwrap();
+        (
+            config.ssid,
+            config.password,
+            config.internet_iface,
+            config.wifi_iface,
+            config.freq_band,
         )
-        .interact()?;
-    let internet_iface = &interfaces[internet_index];
+    } else {
+        let default_ssid = saved_config.as_ref().map(|c| c.ssid.clone()).unwrap_or_else(|| "DCT_Linux".to_string());
+        let ssid: String = Input::with_theme(&theme)
+            .with_prompt("Enter Hotspot SSID (Name)")
+            .default(default_ssid)
+            .interact_text()?;
 
-    // Select wifi interface
-    let wifi_index = Select::with_theme(&theme)
-        .with_prompt("Select Wi-Fi interface to host hotspot")
-        .items(&interfaces)
-        .default(
-            interfaces
-                .iter()
-                .position(|x| *x == default_wifi)
-                .unwrap_or(0),
-        )
-        .interact()?;
-    let wifi_iface = &interfaces[wifi_index];
+        let default_password = saved_config.as_ref().map(|c| c.password.clone()).unwrap_or_else(|| "Tryh4ckm3;".to_string());
+        let password: String = Input::with_theme(&theme)
+            .with_prompt("Enter Hotspot Password (min. 8 chars)")
+            .default(default_password)
+            .validate_with(|input: &String| -> Result<(), &str> {
+                if input.len() >= 8 { Ok(()) } else { Err("Password must be at least 8 characters long") }
+            })
+            .interact_text()?;
+
+        // Select internet interface
+        let internet_index = Select::with_theme(&theme)
+            .with_prompt("Select interface providing internet")
+            .items(&interfaces)
+            .default(interfaces.iter().position(|x| *x == default_internet).unwrap_or(0))
+            .interact()?;
+        let internet_iface = interfaces[internet_index].clone();
+
+        // Select wifi interface
+        let wifi_index = Select::with_theme(&theme)
+            .with_prompt("Select Wi-Fi interface to host hotspot")
+            .items(&interfaces)
+            .default(interfaces.iter().position(|x| *x == default_wifi).unwrap_or(0))
+            .interact()?;
+        let wifi_iface = interfaces[wifi_index].clone();
+
+        // Select frequency band
+        let bands = vec!["2.4", "5"];
+        let band_index = Select::with_theme(&theme)
+            .with_prompt("Select Wi-Fi Frequency Band (GHz)")
+            .items(&bands)
+            .default(0)
+            .interact()?;
+        let freq_band = bands[band_index].to_string();
+
+        let new_config = HotspotConfig {
+            ssid: ssid.clone(),
+            password: password.clone(),
+            internet_iface: internet_iface.clone(),
+            wifi_iface: wifi_iface.clone(),
+            freq_band: freq_band.clone(),
+        };
+        save_config(&new_config);
+
+        (ssid, password, internet_iface, wifi_iface, freq_band)
+    };
 
     println!("\nConfiguration Summary:");
     println!("   SSID:      {}", ssid);
     println!("   Password:  {}", password);
     println!("   Sharing:   {} -> {}", internet_iface, wifi_iface);
+    println!("   Band:      {} GHz", freq_band);
     println!();
 
-    // 6. Setup exit signal handling
-    let running = Arc::new(AtomicBool::new(true));
-    let r = running.clone();
-    ctrlc::set_handler(move || {
-        println!("\nReceived exit signal! Initiating shutdown...");
-        r.store(false, Ordering::SeqCst);
-    })
-    .expect("Error setting Ctrl-C handler");
-
-    // 7. Spawn create_ap process
-    println!("Starting create_ap...");
+    // 7. Spawn create_ap process in daemon mode
+    println!("Starting create_ap in background...");
     let mut child = Command::new("sudo")
-        .args(&["create_ap", wifi_iface, internet_iface, &ssid, &password])
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
+        .args(&[
+            "create_ap",
+            "--daemon",
+            "--freq-band",
+            &freq_band,
+            &wifi_iface,
+            &internet_iface,
+            &ssid,
+            &password,
+        ])
         .spawn()?;
 
-    let child_stdout = child.stdout.take().expect("Failed to open stdout");
-    let child_stderr = child.stderr.take().expect("Failed to open stderr");
-
-    // Thread to monitor stdout and show TUI when AP is enabled
-    let ssid_clone = ssid.clone();
-    let password_clone = password.clone();
-    let running_clone = running.clone();
-
-    thread::spawn(move || {
-        let reader = BufReader::new(child_stdout);
-        let mut ap_enabled = false;
-
-        for line in reader.lines() {
-            if !running_clone.load(Ordering::SeqCst) {
-                break;
-            }
-            if let Ok(line) = line {
-                if !ap_enabled {
-                    println!("   [create_ap] {}", line);
-                }
-                if line.contains("AP-ENABLED") {
-                    ap_enabled = true;
-                    show_dashboard(&ssid_clone, &password_clone);
-                }
-            }
-        }
-    });
-
-    // Thread to monitor stderr
-    thread::spawn(move || {
-        let reader = BufReader::new(child_stderr);
-        for line in reader.lines() {
-            if let Ok(line) = line {
-                eprintln!("   [create_ap error] {}", line);
-            }
-        }
-    });
-
-    // Main loop: Wait until exit signal
-    while running.load(Ordering::SeqCst) {
-        if let Ok(Some(_)) = child.try_wait() {
-            println!("Error: create_ap terminated unexpectedly.");
-            break;
-        }
-        thread::sleep(Duration::from_millis(200));
+    // Wait a brief moment to allow initialization
+    thread::sleep(Duration::from_secs(3));
+    
+    // Check if it exited immediately (error)
+    if let Ok(Some(status)) = child.try_wait() {
+        eprintln!("Error: create_ap failed to start (exit code {}).", status);
+        return Ok(());
     }
 
-    // 8. Cleanup on exit
-    println!("Stopping create_ap process group...");
-
-    // Kill the underlying create_ap processes cleanly using pkill
-    let _ = Command::new("sudo")
-        .args(&["pkill", "-SIGINT", "-f", "create_ap"])
-        .status();
-
-    // Kill the spawned sudo wrapper process
-    let _ = child.kill();
-    let _ = child.wait();
-
-    // Wait a brief moment to allow create_ap's internal cleanup script to finish running
-    thread::sleep(Duration::from_millis(800));
-
-    // Cleanup virtual interfaces & stale processes
-    cleanup_virtual_interfaces();
-    cleanup_stale_processes();
-
-    // Terminate any leftover imv windows
-    let _ = Command::new("pkill").arg("imv").status();
-
-    println!("Success: Hotspot stopped and cleaned up successfully.");
-
-    // We explicitly avoid stdout_handle.join() and stderr_handle.join()
-    // to prevent deadlocks when closing the process pipes on Ctrl+C.
+    show_dashboard(&ssid, &password);
+    println!("The hotspot is running in the background.");
+    println!("Run `omarchy-hotspot stop` to shut it down.");
 
     Ok(())
 }
